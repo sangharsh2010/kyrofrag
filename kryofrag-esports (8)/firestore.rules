@@ -1,0 +1,238 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================
+    // HELPER FUNCTIONS
+    // =========================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && request.auth.token.email != null
+        && request.auth.token.email.lower() == 'sangharshkale182010@gmail.com';
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    // Check if the caller was genuinely referred by `targetUid` and still pending unlock
+    function isPendingRefereeOf(targetUid) {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('referredByUid', '') == targetUid
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('referralStatus', 'none') == 'pending';
+    }
+
+    // =========================================================
+    // 1. CONNECTION CHECK (test/connection)
+    // =========================================================
+    match /test/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // =========================================================
+    // 2. SETTINGS (general, global, whatsappPopup, spinWheel, referralBonus)
+    // =========================================================
+    match /settings/{settingId} {
+      // Loaded at startup before & after login (maintenance, app name, UPI, spin, referral config)
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // =========================================================
+    // 3. PROMOTIONAL BANNERS (banners)
+    // =========================================================
+    match /banners/{bannerId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 4. PROMO CODES (promoCodes/{CODE})
+    // =========================================================
+    match /promoCodes/{codeId} {
+      // Users can look up a single known code to redeem, but cannot list/scrape all codes
+      allow get: if isSignedIn();
+      allow list: if isAdmin();
+      allow create, delete: if isAdmin();
+
+      // Admin has full update; Users may only increment usedCount by 1 during redemption
+      allow update: if isAdmin() || (
+        isSignedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedCount'])
+        && request.resource.data.usedCount is number
+        && request.resource.data.usedCount == resource.data.get('usedCount', 0) + 1
+        && (
+          resource.data.get('maxUses', 0) == 0
+          || resource.data.get('usedCount', 0) < resource.data.get('maxUses', 0)
+        )
+      );
+    }
+
+    // =========================================================
+    // 5. USERS (users/{uid})
+    // =========================================================
+    match /users/{userId} {
+      // Owner, Admin, or a referee reading their referrer during first-match bonus unlock
+      allow get: if isOwner(userId) || isAdmin() || (isSignedIn() && isPendingRefereeOf(userId));
+      // Admin lists all users; signed-in user referral lookup (where referralCode == ...) uses list
+      allow list: if isAdmin() || isSignedIn();
+
+      allow create: if isAdmin() || (
+        isOwner(userId)
+        && request.resource.data.get('walletBalance', 0) == 0
+        && request.resource.data.get('isBlocked', false) == false
+        && request.resource.data.get('hasApprovedDeposit', false) == false
+        && request.resource.data.get('ffUidLocked', false) == false
+      );
+
+      allow update: if isAdmin()
+        || (
+          // User updating own profile, FF UID lock, Spin, Promo, Withdraw, or Match Join
+          isOwner(userId)
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'isBlocked',
+            'hasApprovedDeposit',
+            'referredByUid',
+            'referredByCode',
+            'email'
+          ])
+          && (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['referralCode'])
+            || resource.data.get('referralCode', '') == ''
+          )
+          && request.resource.data.get('walletBalance', 0) >= 0
+          // Once FF UID is locked by the user, only Admin can edit or unlock it
+          && (
+            resource.data.get('ffUidLocked', false) == false
+            || (
+              request.resource.data.get('ffUidLocked', false) == true
+              && request.resource.data.get('ffUid', '') == resource.data.get('ffUid', '')
+            )
+          )
+        )
+        || (
+          // Referee unlocking their referrer's wallet reward on first match join
+          isSignedIn()
+          && isPendingRefereeOf(userId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['walletBalance'])
+          && request.resource.data.walletBalance >= resource.data.get('walletBalance', 0)
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 6. TOURNAMENTS / MATCHES (matches/{matchId})
+    // =========================================================
+    match /matches/{matchId} {
+      allow read: if isSignedIn();
+      allow create, delete: if isAdmin();
+
+      // Admin can edit, publish rooms/results, clone, or cancel & refund.
+      // Players can only join an open match (increment joinedCount by 1 & append 1 participant).
+      allow update: if isAdmin() || (
+        isSignedIn()
+        && !(resource.data.get('status', 'Upcoming') in ['Cancelled', 'Completed'])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['joinedCount', 'participants'])
+        && request.resource.data.joinedCount is number
+        && request.resource.data.joinedCount == resource.data.get('joinedCount', 0) + 1
+        && request.resource.data.joinedCount <= resource.data.get('maxSlots', 48)
+        && request.resource.data.participants is list
+        && request.resource.data.participants.size() == resource.data.get('participants', []).size() + 1
+      );
+    }
+
+    // =========================================================
+    // 7. DEPOSITS (deposits/{depositId})
+    // =========================================================
+    match /deposits/{depositId} {
+      allow get: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      // Signed-in users query where('utr', '==', rawUtr) to check duplicate UTR numbers
+      allow list: if isAdmin() || isSignedIn();
+
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'Pending'
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0;
+
+      allow update, delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 8. WITHDRAWALS (withdrawals/{withdrawalId})
+    // =========================================================
+    match /withdrawals/{withdrawalId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'Pending'
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0;
+
+      allow update, delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 9. WALLET PASSBOOK / TRANSACTIONS (transactions/{txId})
+    // =========================================================
+    match /transactions/{txId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+
+      allow create: if isAdmin()
+        || (
+          isSignedIn()
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.amount is number
+          && request.resource.data.amount >= 0
+          && request.resource.data.isCredit is bool
+          && isValidString(request.resource.data.type, 1, 60)
+        )
+        || (
+          // First-match Referral Reward log created for the referrer by their pending referee
+          isSignedIn()
+          && request.resource.data.type == 'Referral Reward'
+          && request.resource.data.isCredit == true
+          && request.resource.data.status == 'Completed'
+          && request.resource.data.amount is number
+          && request.resource.data.amount > 0
+          && isPendingRefereeOf(request.resource.data.uid)
+        );
+
+      // Admin updates pending Deposit/Withdrawal transaction status on Approve/Reject/Paid
+      allow update, delete: if isAdmin();
+    }
+
+    // =========================================================
+    // 10. COMPLAINT / DISPUTE TICKETS (complaints/{ticketId})
+    // =========================================================
+    match /complaints/{ticketId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'Open'
+        && request.resource.data.get('adminNote', '') == ''
+        && isValidString(request.resource.data.message, 8, 2000);
+
+      allow update, delete: if isAdmin();
+    }
+
+    // =========================================================
+    // DEFAULT DENY
+    // =========================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
